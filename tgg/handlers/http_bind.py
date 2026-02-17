@@ -1,0 +1,181 @@
+# handlers/http_bind.py
+from aiogram import Router, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from config import ADMIN_IDS
+from database import db
+from utils import format_number
+
+router = Router()
+
+class HTTPBindStates(StatesGroup):
+    waiting_for_user_id = State()
+
+@router.callback_query(F.data.startswith("http_bind_"))
+async def http_bind_donation(callback: types.CallbackQuery, state: FSMContext):
+    """Привязка HTTP доната к пользователю"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    donation_id = callback.data.split("_")[2]
+    await state.update_data(donation_id=donation_id)
+    
+    await callback.message.edit_text(
+        f"🔗 Введите ID пользователя Telegram для привязки доната `{donation_id}`:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="http_cancel_bind")]
+        ])
+    )
+    await state.set_state(HTTPBindStates.waiting_for_user_id)
+    await callback.answer()
+
+@router.message(HTTPBindStates.waiting_for_user_id)
+async def process_http_bind_user_id(message: types.Message, state: FSMContext):
+    """Обработка введенного ID пользователя"""
+    try:
+        user_id = int(message.text.strip())
+        data = await state.get_data()
+        donation_id = data.get("donation_id")
+        
+        # Получаем информацию о донате
+        payment = db.get_http_payment(donation_id)
+        if not payment:
+            await message.answer("❌ Донат не найден")
+            await state.clear()
+            return
+        
+        # Проверяем существование пользователя
+        user = db.get_user(user_id)
+        if not user:
+            await message.answer(
+                f"❌ Пользователь с ID {user_id} не найден!\n"
+                f"Убедитесь, что пользователь запускал бота хотя бы раз.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="http_cancel_bind")]
+                ])
+            )
+            return
+        
+        # Подтверждаем платеж и начисляем монеты
+        if db.confirm_http_payment(donation_id, message.from_user.id, user_id):
+            # Получаем обновленный баланс
+            updated_user = db.get_user(user_id)
+            
+            await message.answer(
+                f"✅ Донат успешно привязан!\n\n"
+                f"👤 Пользователь: {user['first_name'] or user_id}\n"
+                f"💰 Сумма: {payment['amount']} руб.\n"
+                f"🎁 Начислено: +{payment['coins']} монет\n"
+                f"Новый баланс: {format_number(updated_user['balance'])} монет"
+            )
+            
+            # Уведомляем пользователя
+            try:
+                await message.bot.send_message(
+                    user_id,
+                    f"✅ **Вам начислены монеты!**\n\n"
+                    f"Вы получили **+{payment['coins']}** монет за донат через DonationAlerts!\n"
+                    f"Сумма доната: {payment['amount']} руб.\n"
+                    f"Сообщение: {payment['message'] or '—'}\n\n"
+                    f"Спасибо за поддержку! 🎲",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                await message.answer(f"⚠️ Не удалось уведомить пользователя: {e}")
+        else:
+            await message.answer("❌ Ошибка при подтверждении платежа")
+        
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Введите корректный ID (число)!")
+
+@router.callback_query(F.data.startswith("http_confirm_"))
+async def http_confirm_without_user(callback: types.CallbackQuery):
+    """Подтверждение доната без привязки к пользователю"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    donation_id = callback.data.split("_")[2]
+    
+    # Получаем информацию о донате
+    payment = db.get_http_payment(donation_id)
+    if not payment:
+        await callback.answer("❌ Донат не найден", show_alert=True)
+        return
+    
+    if payment['status'] != 'pending':
+        await callback.answer("❌ Донат уже обработан", show_alert=True)
+        return
+    
+    # Обновляем статус (без начисления)
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE da_http_payments 
+            SET status = 'completed', processed_at = CURRENT_TIMESTAMP, admin_id = ?
+            WHERE donation_id = ?
+        ''', (callback.from_user.id, donation_id))
+        conn.commit()
+    
+    await callback.message.edit_text(
+        f"✅ Донат `{donation_id}` отмечен как обработанный (без начисления)\n"
+        f"Сумма: {payment['amount']} руб.\n"
+        f"Отправитель: {payment['username']}",
+        parse_mode="Markdown"
+    )
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "http_cancel_bind")
+async def http_cancel_bind(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена привязки"""
+    await state.clear()
+    await callback.message.edit_text("❌ Привязка отменена")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_pending_http_payments")
+async def admin_pending_http_payments(callback: types.CallbackQuery):
+    """Список ожидающих платежей из HTTP"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    payments = db.get_pending_http_payments()
+    
+    if not payments:
+        await callback.message.edit_text(
+            "📭 Нет ожидающих платежей из DonationAlerts HTTP",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_pending_http_payments")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_donation_menu")]
+            ])
+        )
+        await callback.answer()
+        return
+    
+    text = "📋 **Ожидающие платежи (HTTP)**\n\n"
+    
+    for p in payments[:10]:
+        text += f"🆔 ID: `{p['donation_id'][:8]}...`\n"
+        text += f"👤 Отправитель: {p['username']}\n"
+        text += f"💰 {p['amount']} руб. = {p['coins']} монет\n"
+        text += f"💬 Сообщение: {p['message'][:30] or '—'}\n"
+        text += f"📅 {p['created_at'][:16]}\n\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_pending_http_payments")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_donation_menu")]
+    ])
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await callback.answer()
